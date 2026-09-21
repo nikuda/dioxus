@@ -1,4 +1,4 @@
-use crate::bundler::{copy_dir_recursive, AppCategory, Bundle, BundleContext};
+use crate::bundler::{copy_dir_recursive, version, AppCategory, Bundle, BundleContext};
 use crate::{MacOsSettings, PackageType};
 use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageReader};
@@ -481,7 +481,7 @@ impl BundleContext<'_> {
             plist::Value::String("APPL".into()),
         );
 
-        let version = self.version_string();
+        let version = version::macos(self.package_version());
         let bundle_version = macos_settings.bundle_version.as_deref().unwrap_or(&version);
 
         dict.insert(
