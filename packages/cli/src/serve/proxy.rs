@@ -308,7 +308,7 @@ mod test {
                     format!("backend: {}", request.uri())
                 }),
             );
-        let backend_handle = Handle::new();
+        let backend_handle: Handle<std::net::SocketAddr> = Handle::new();
         let backend_handle_ = backend_handle.clone();
         tokio::spawn(async move {
             Server::bind("127.0.0.1:0".parse().unwrap())
@@ -324,7 +324,7 @@ mod test {
             nocache,
             super::handle_proxy_error,
         ));
-        let server_handle = Handle::new();
+        let server_handle: Handle<std::net::SocketAddr> = Handle::new();
         let server_handle_ = server_handle.clone();
         tokio::spawn(async move {
             Server::bind("127.0.0.1:0".parse().unwrap())
