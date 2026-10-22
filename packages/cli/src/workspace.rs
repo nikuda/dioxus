@@ -6,6 +6,7 @@ use anyhow::{Context, bail};
 use ignore::gitignore::Gitignore;
 use krates::{Cmd, Krates, NodeId};
 use krates::{KrateDetails, LockOptions, semver::Version};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::{collections::HashSet, path::Path};
 use std::{path::PathBuf, time::Duration};
@@ -14,6 +15,8 @@ use tokio::process::Command;
 
 pub struct Workspace {
     pub(crate) krates: Krates,
+    pub(crate) target_dir: PathBuf,
+    pub(crate) cargo_build_dir: PathBuf,
     pub(crate) settings: CliSettings,
     pub(crate) wasm_opt: Option<PathBuf>,
     pub(crate) sysroot: PathBuf,
@@ -21,6 +24,50 @@ pub struct Workspace {
     pub(crate) ignore: Gitignore,
     pub(crate) cargo_toml: cargo_toml::Manifest,
     pub(crate) android_tools: Option<Arc<AndroidTools>>,
+}
+
+#[derive(Deserialize)]
+struct CargoDirectories {
+    target_directory: krates::cm::PathBuf,
+    #[serde(default)]
+    build_directory: Option<krates::cm::PathBuf>,
+}
+
+impl CargoDirectories {
+    fn from_metadata_json(metadata: &str) -> Result<Self, krates::cm::Error> {
+        Ok(serde_json::from_str(metadata)?)
+    }
+
+    fn into_std_paths(self) -> (PathBuf, PathBuf) {
+        let target_dir = self.target_directory.into_std_path_buf();
+        let cargo_build_dir = self
+            .build_directory
+            .map(krates::cm::PathBuf::into_std_path_buf)
+            .unwrap_or_else(|| target_dir.clone());
+        (target_dir, cargo_build_dir)
+    }
+}
+
+fn load_cargo_metadata(
+    cmd: Cmd,
+) -> Result<(krates::cm::Metadata, PathBuf, PathBuf), krates::cm::Error> {
+    let metadata_command = krates::cm::MetadataCommand::from(cmd);
+    let output = metadata_command.cargo_command().output()?;
+    if !output.status.success() {
+        return Err(krates::cm::Error::CargoMetadata {
+            stderr: String::from_utf8(output.stderr)?,
+        });
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .ok_or(krates::cm::Error::NoJson)?;
+    let directories = CargoDirectories::from_metadata_json(stdout)?;
+    let metadata = krates::cm::MetadataCommand::parse(stdout)?;
+    let (target_dir, cargo_build_dir) = directories.into_std_paths();
+
+    Ok((metadata, target_dir, cargo_build_dir))
 }
 
 /// Process-wide cache of the loaded workspace. `Workspace::current()` populates this on first
@@ -50,9 +97,12 @@ impl Workspace {
             let mut cmd = Cmd::new();
             cmd.lock_opts(lock_options);
 
+            let (metadata, target_dir, cargo_build_dir) =
+                load_cargo_metadata(cmd).map_err(krates::Error::from)?;
+
             let mut builder = krates::Builder::new();
             builder.workspace(true);
-            let res = builder.build(cmd, |_| {})?;
+            let res = builder.build_with_metadata(metadata, |_| {})?;
 
             if !lock_options.offline {
                 if let Ok(res) = std::env::var("SIMULATE_SLOW_NETWORK") {
@@ -60,7 +110,8 @@ impl Workspace {
                 }
             }
 
-            Ok(res) as Result<Krates, krates::Error>
+            Ok((res, target_dir, cargo_build_dir))
+                as Result<(Krates, PathBuf, PathBuf), krates::Error>
         });
 
         let spin_future = async move {
@@ -79,7 +130,7 @@ impl Workspace {
             }
         };
 
-        let krates = tokio::select! {
+        let (krates, target_dir, cargo_build_dir) = tokio::select! {
             f = krates_future => {
                 let res = f?;
                 if let Err(krates::Error::Metadata(e)) = res {
@@ -111,6 +162,8 @@ impl Workspace {
 
         let workspace = Arc::new(Self {
             krates,
+            target_dir,
+            cargo_build_dir,
             settings,
             wasm_opt,
             sysroot: sysroot.trim().into(),
@@ -125,10 +178,14 @@ impl Workspace {
                • sysroot: {sysroot}
                • rustc version: {rustc_version}
                • workspace root: {workspace_root}
+               • target dir: {target_dir}
+               • cargo build dir: {cargo_build_dir}
                • dioxus versions: [{dioxus_versions:?}]"#,
             sysroot = workspace.sysroot.display(),
             rustc_version = workspace.rustc_version,
             workspace_root = workspace.workspace_root().display(),
+            target_dir = workspace.target_dir.display(),
+            cargo_build_dir = workspace.cargo_build_dir.display(),
             dioxus_versions = workspace
                 .dioxus_versions()
                 .iter()
@@ -674,5 +731,35 @@ impl std::fmt::Debug for Workspace {
             .field("sysroot", &self.sysroot)
             .field("wasm_opt", &self.wasm_opt)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CargoDirectories;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cargo_directories_preserve_separate_build_directory() {
+        let directories = CargoDirectories::from_metadata_json(
+            r#"{"target_directory":"target-dir","build_directory":"build-dir"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            directories.into_std_paths(),
+            (PathBuf::from("target-dir"), PathBuf::from("build-dir"))
+        );
+    }
+
+    #[test]
+    fn cargo_directories_fall_back_for_older_cargo() {
+        let directories =
+            CargoDirectories::from_metadata_json(r#"{"target_directory":"target-dir"}"#).unwrap();
+
+        assert_eq!(
+            directories.into_std_paths(),
+            (PathBuf::from("target-dir"), PathBuf::from("target-dir"))
+        );
     }
 }
