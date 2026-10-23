@@ -13,12 +13,12 @@ use dioxus::prelude::*;
 fn main() {
     dioxus::LaunchBuilder::new()
         .with_cfg(desktop! {{
-            use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+            use dioxus::desktop::{Config, LogicalSize, WindowAttributes};
             Config::new().with_window(
-                WindowBuilder::new()
+                WindowAttributes::default()
                     .with_title("Calculator Demo")
                     .with_resizable(false)
-                    .with_inner_size(LogicalSize::new(320.0, 530.0)),
+                    .with_surface_size(LogicalSize::new(320.0, 530.0)),
             )
         }})
         .with_cfg(native! {{

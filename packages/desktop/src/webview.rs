@@ -4,8 +4,13 @@ use crate::desktop_state::DesktopAppContext;
 use crate::file_upload::{DesktopFileData, DesktopFileDragEvent};
 use crate::menubar::DioxusMenu;
 use crate::{
-    DesktopContext, DesktopService, WindowConfig, assets::AssetHandlerRegistry, edits::WryQueue,
-    file_upload::NativeFileHover, ipc::UserWindowEvent, protocol,
+    DesktopContext, DesktopService, WindowConfig,
+    assets::AssetHandlerRegistry,
+    edits::WryQueue,
+    file_upload::NativeFileHover,
+    ipc::UserWindowEvent,
+    protocol,
+    windowing::{HostWindow, Position, Size},
 };
 use crate::{element::DesktopElement, file_upload::DesktopFormData};
 use base64::prelude::BASE64_STANDARD;
@@ -15,12 +20,19 @@ use dioxus_html::{FileData, FormValue, HtmlEvent, PlatformEventData, SerializedF
 use std::rc::Rc;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::{cell::OnceCell, time::Duration};
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use tao::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use winit::{
+    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    event_loop::ActiveEventLoop,
+};
 use wry::{DragDropEvent, RequestAsyncResponder, WebContext, WebViewBuilder, WebViewId};
 
 fn restore_window_state(
-    window: &tao::window::Window,
-    explicit_inner_size: Option<tao::dpi::Size>,
-    explicit_window_position: Option<tao::dpi::Position>,
+    window: &HostWindow,
+    explicit_inner_size: Option<Size>,
+    explicit_window_position: Option<Position>,
 ) {
     if cfg!(target_os = "android") || cfg!(target_os = "ios") || !cfg!(debug_assertions) {
         return;
@@ -38,17 +50,33 @@ fn restore_window_state(
 
     if explicit_window_position.is_none() {
         if cfg!(target_os = "macos") {
-            window.set_outer_position(tao::dpi::LogicalPosition::new(position.0, position.1));
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window.set_outer_position(LogicalPosition::new(position.0, position.1).into());
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            window.set_outer_position(LogicalPosition::new(position.0, position.1));
         } else {
-            window.set_outer_position(tao::dpi::PhysicalPosition::new(position.0, position.1));
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window.set_outer_position(PhysicalPosition::new(position.0, position.1).into());
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            window.set_outer_position(PhysicalPosition::new(position.0, position.1));
         }
     }
 
     if explicit_inner_size.is_none() {
         if cfg!(target_os = "macos") {
-            window.set_inner_size(tao::dpi::LogicalSize::new(size.0, size.1));
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                _ = window.request_surface_size(LogicalSize::new(size.0, size.1).into());
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            window.set_inner_size(LogicalSize::new(size.0, size.1));
         } else {
-            window.set_inner_size(tao::dpi::PhysicalSize::new(size.0, size.1));
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                _ = window.request_surface_size(PhysicalSize::new(size.0, size.1).into());
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            window.set_inner_size(PhysicalSize::new(size.0, size.1));
         }
     }
 }
@@ -293,19 +321,16 @@ fn android_handler_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub(crate) struct WebviewInstance {
+    // Menus retain native handles into the host window. Drop them before the
+    // WebView and window stored in `desktop_context`.
+    _menu: Option<DioxusMenu>,
+
     pub edits: WebviewEdits,
     pub desktop_context: DesktopContext,
 
     // Wry assumes the webcontext is alive for the lifetime of the webview.
     // We need to keep the webcontext alive, otherwise the webview will crash
     _web_context: WebContext,
-
-    // Same with the menu.
-    // Currently it's a DioxusMenu because 1) we don't touch it and 2) we support a number of platforms
-    // like ios where muda does not give us a menu type. It sucks but alas.
-    //
-    // This would be a good thing for someone looking to contribute to fix.
-    _menu: Option<DioxusMenu>,
 }
 
 impl WebviewInstance {
@@ -320,29 +345,54 @@ impl WebviewInstance {
         target_id: RenderTargetId,
         dom: &mut VirtualDom,
         app_context: Rc<DesktopAppContext>,
+        #[cfg(not(any(target_os = "android", target_os = "ios")))] event_loop: &dyn ActiveEventLoop,
     ) -> WebviewInstance {
         let mut window = cfg.window.clone();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let explicit_window_size = cfg.window.surface_size;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let explicit_window_position = cfg.window.position;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let explicit_window_size = cfg.window.window.inner_size;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let explicit_window_position = cfg.window.window.position;
 
-        // tao makes small windows for some reason, make them bigger on desktop
-        //
-        // on mobile, we want them to be `None` so tao makes them the size of the screen. Otherwise we
-        // get a window that is not the size of the screen and weird black bars.
+        // Give desktop windows a useful default size. On mobile, leave the
+        // dimensions unset so Tao uses the full available screen.
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
-            if cfg.window.window.inner_size.is_none() {
-                window = window.with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0));
+            if cfg.window.surface_size.is_none() {
+                window = window.with_surface_size(LogicalSize::new(800.0, 600.0));
             }
         }
 
         // We assume that if the icon is None in cfg, then the user just didnt set it
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if cfg.window.window_icon.is_none() {
+            window = window.with_window_icon(crate::default_icon().ok());
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if cfg.window.window.window_icon.is_none() {
             window = window.with_window_icon(crate::default_icon().ok());
         }
 
-        let window = Arc::new(window.build(&app_context.target).unwrap());
-        restore_window_state(&window, explicit_window_size, explicit_window_position);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let window: Arc<HostWindow> = Arc::from(
+            event_loop
+                .create_window(window)
+                .expect("failed to create a Winit desktop window"),
+        );
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let window: Arc<HostWindow> = Arc::new(
+            window
+                .build(&app_context.target)
+                .expect("failed to create a Tao mobile window"),
+        );
+        restore_window_state(
+            window.as_ref(),
+            explicit_window_size,
+            explicit_window_position,
+        );
         if let Some(on_build) = cfg.on_window.as_mut() {
             on_build(window.clone(), dom);
         }
@@ -351,10 +401,23 @@ impl WebviewInstance {
         #[cfg(target_os = "macos")]
         {
             use objc2::rc::Retained;
-            use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
-            use tao::platform::macos::WindowExtMacOS;
-            let ns_window: Retained<NSWindow> =
-                unsafe { Retained::retain(window.ns_window().cast()) }.unwrap();
+            use objc2_app_kit::{NSView, NSWindowCollectionBehavior};
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            let handle = window
+                .window_handle()
+                .expect("Winit's AppKit window must expose a window handle");
+            let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+                unreachable!("a macOS Winit window must expose an AppKit handle")
+            };
+            // SAFETY: WindowHandle guarantees that AppKitWindowHandle's
+            // non-null pointer names a valid NSView for the handle lifetime.
+            let ns_view: Retained<NSView> =
+                unsafe { Retained::retain(handle.ns_view.as_ptr().cast()) }
+                    .expect("AppKit window handles contain a non-null NSView");
+            let ns_window = ns_view
+                .window()
+                .expect("Winit's NSView must be installed in an NSWindow");
             ns_window.setCollectionBehavior(NSWindowCollectionBehavior::Managed)
         }
 
@@ -375,6 +438,9 @@ impl WebviewInstance {
         let asset_handlers = AssetHandlerRegistry::new();
         let edits = WebviewEdits::new(dom.runtime(), target_id, edit_queue.clone());
         let file_hover = NativeFileHover::default();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let headless = !cfg.window.visible;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let headless = !cfg.window.window.visible;
 
         let request_handler = {
@@ -467,11 +533,38 @@ impl WebviewInstance {
             .with_bounds(wry::Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
                 size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
-                    window.inner_size().width,
-                    window.inner_size().height,
+                    {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        {
+                            window.surface_size().width
+                        }
+                        #[cfg(any(target_os = "android", target_os = "ios"))]
+                        {
+                            window.inner_size().width
+                        }
+                    },
+                    {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        {
+                            window.surface_size().height
+                        }
+                        #[cfg(any(target_os = "android", target_os = "ios"))]
+                        {
+                            window.inner_size().height
+                        }
+                    },
                 )),
             })
-            .with_transparent(cfg.window.window.transparent)
+            .with_transparent({
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    cfg.window.transparent
+                }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    cfg.window.window.transparent
+                }
+            })
             .with_url("dioxus://index.html/")
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler(move |var| {
@@ -569,16 +662,6 @@ impl WebviewInstance {
             webview = webview.with_devtools(true);
         }
 
-        let menu = if cfg!(not(any(target_os = "android", target_os = "ios"))) {
-            let menu_option = cfg.menu.into();
-            if let Some(menu) = &menu_option {
-                crate::menubar::init_menu_bar(menu, &window);
-            }
-            menu_option
-        } else {
-            None
-        };
-
         #[cfg(target_os = "windows")]
         {
             use wry::WebViewBuilderExtWindows;
@@ -587,31 +670,23 @@ impl WebviewInstance {
             }
         }
 
-        #[cfg(any(
-            target_os = "windows",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "android"
-        ))]
         let webview = if cfg.as_child_window {
             webview.build_as_child(&window)
         } else {
             webview.build(&window)
         };
-
-        #[cfg(not(any(
-            target_os = "windows",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "android"
-        )))]
-        let webview = {
-            use tao::platform::unix::WindowExtUnix;
-            use wry::WebViewBuilderExtUnix;
-            let vbox = window.default_vbox().unwrap();
-            webview.build_gtk(vbox)
-        };
         let webview = webview.unwrap();
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let menu = {
+            let menu_option = cfg.menu.into();
+            if let Some(menu) = &menu_option {
+                crate::menubar::init_menu_bar(menu, window.as_ref(), &webview);
+            }
+            menu_option
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let menu = None;
 
         let desktop_context = Rc::from(DesktopService::new(
             webview,
@@ -719,8 +794,16 @@ impl PendingWebview {
         self,
         dom: &mut VirtualDom,
         app_context: &Rc<DesktopAppContext>,
+        #[cfg(not(any(target_os = "android", target_os = "ios")))] event_loop: &dyn ActiveEventLoop,
     ) -> WebviewInstance {
-        let window = WebviewInstance::new(self.cfg, self.target_id, dom, app_context.clone());
+        let window = WebviewInstance::new(
+            self.cfg,
+            self.target_id,
+            dom,
+            app_context.clone(),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            event_loop,
+        );
 
         _ = self.sender.send(window.desktop_context.clone());
 

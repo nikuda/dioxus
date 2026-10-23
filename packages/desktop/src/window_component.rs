@@ -58,12 +58,12 @@ impl From<WindowConfig> for InitialWindowConfig {
 ///
 /// ```rust,ignore
 /// use dioxus::prelude::*;
-/// use dioxus::desktop::{Window, WindowBuilder, WindowConfig};
+/// use dioxus::desktop::{Window, WindowAttributes, WindowConfig};
 ///
 /// fn App() -> Element {
 ///     rsx! {
 ///         Window {
-///             config: WindowConfig::new().with_window(WindowBuilder::new().with_title("Inspector")),
+///             config: WindowConfig::new().with_window(WindowAttributes::default().with_title("Inspector")),
 ///             onclose: move |_| tracing::info!("inspector closed"),
 ///             div { "Tools" }
 ///         }

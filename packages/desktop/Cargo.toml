@@ -47,7 +47,6 @@ dioxus-hooks = { workspace = true }
 futures-util = { workspace = true }
 percent-encoding = { workspace = true }
 async-trait = { workspace = true }
-tao = { workspace = true, features = ["rwh_05"] }
 dioxus-history = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true}
@@ -60,7 +59,15 @@ webbrowser = { workspace = true }
 signal-hook = "0.3.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-wry = { workspace = true, features = ["os-webview", "linux-body"] }
+wry = { workspace = true, features = ["os-webview", "linux-body", "x11"] }
+gtk = "0.18.2"
+x11-dl = "2.21"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+winit = { workspace = true }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tao = { workspace = true, features = ["rwh_05"] }
 
 [target.'cfg(any(target_os = "windows",target_os = "macos",target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 global-hotkey = "0.9.0"
@@ -89,7 +96,7 @@ tungstenite = { workspace = true, features = ["native-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
-objc2-app-kit = { workspace = true, features = ["NSView"] }
+objc2-app-kit = { workspace = true, features = ["NSResponder", "NSView", "NSWindow"] }
 
 [build-dependencies]
 lazy-js-bundle = { workspace = true }
@@ -124,12 +131,6 @@ reqwest = { workspace = true, features = ["json"] }
 http-range = { version = "0.1.5" }
 dioxus-ssr = { workspace = true, default-features = false }
 separator = "0.4.1"
-winit = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-gtk = "0.18.2"
-wry = { workspace = true, features = ["os-webview", "x11"] }
-x11-dl = "2.21"
 
 # These tests need to be run on the main thread, so they cannot use rust's test harness.
 [[test]]
@@ -155,4 +156,9 @@ harness = false
 [[test]]
 name = "check_multiwindow"
 path = "headless_tests/multiwindow.rs"
+harness = false
+
+[[test]]
+name = "check_shutdown"
+path = "headless_tests/shutdown.rs"
 harness = false

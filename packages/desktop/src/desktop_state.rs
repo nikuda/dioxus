@@ -1,7 +1,15 @@
 use crate::{
-    WindowConfig, assets::AssetHandlerRegistry, edits::EditWebsocket,
-    event_handlers::WindowEventHandlers, file_upload::NativeFileHover, ipc::UserWindowEvent,
-    query::QueryEngine, shortcut::ShortcutRegistry, webview::PendingWebview,
+    AppEvent, EventHandlerId, WindowConfig,
+    assets::AssetHandlerRegistry,
+    commands::DesktopEventLoopProxy,
+    edits::EditWebsocket,
+    event_handlers::EventHandlers,
+    file_upload::NativeFileHover,
+    ipc::UserWindowEvent,
+    query::QueryEngine,
+    shortcut::ShortcutRegistry,
+    webview::PendingWebview,
+    windowing::{HostWindow, WindowId},
 };
 use dioxus_core::{RenderTargetId, Runtime};
 use std::{
@@ -9,17 +17,17 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use tao::{
-    event_loop::{EventLoopProxy, EventLoopWindowTarget},
-    window::{Window, WindowId},
-};
 use wry::WebView;
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use tao::event_loop::EventLoopWindowTarget;
 
 /// App-wide desktop state shared by every desktop window.
 pub struct DesktopAppContext {
-    pub(crate) proxy: EventLoopProxy<UserWindowEvent>,
+    pub(crate) proxy: DesktopEventLoopProxy,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) target: EventLoopWindowTarget<UserWindowEvent>,
-    pub(crate) event_handlers: WindowEventHandlers,
+    pub(crate) event_handlers: EventHandlers,
     pub(crate) shortcut_manager: ShortcutRegistry,
     pub(crate) websocket: EditWebsocket,
     pending_webviews: RefCell<Vec<PendingWebview>>,
@@ -40,14 +48,26 @@ pub(crate) enum WindowCloseRequestResult {
 }
 
 impl DesktopAppContext {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) fn new(proxy: DesktopEventLoopProxy) -> Self {
+        Self {
+            proxy,
+            event_handlers: EventHandlers::default(),
+            shortcut_manager: ShortcutRegistry::new(),
+            websocket: EditWebsocket::start(),
+            pending_webviews: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) fn new(
-        proxy: EventLoopProxy<UserWindowEvent>,
+        proxy: DesktopEventLoopProxy,
         target: EventLoopWindowTarget<UserWindowEvent>,
     ) -> Self {
         Self {
             proxy,
             target,
-            event_handlers: WindowEventHandlers::default(),
+            event_handlers: EventHandlers::default(),
             shortcut_manager: ShortcutRegistry::new(),
             websocket: EditWebsocket::start(),
             pending_webviews: RefCell::new(Vec::new()),
@@ -59,8 +79,8 @@ impl DesktopAppContext {
         let target_id = Runtime::current().create_render_target();
         let (window, context) = PendingWebview::new(target_id, cfg);
 
-        self.proxy.send_event(UserWindowEvent::NewWindow).unwrap();
         self.queue_pending_webview(window);
+        self.proxy.send_event(UserWindowEvent::NewWindow).unwrap();
 
         context
     }
@@ -77,19 +97,42 @@ impl DesktopAppContext {
     pub(crate) fn drain_pending_webviews(&self) -> Vec<PendingWebview> {
         self.pending_webviews.borrow_mut().drain(..).collect()
     }
+
+    /// Create an application lifecycle event handler.
+    ///
+    /// The returned id can be used with [`Self::remove_event_handler`].
+    pub fn create_app_event_handler(
+        &self,
+        handler: impl FnMut(AppEvent, &Rc<DesktopAppContext>) + 'static,
+    ) -> EventHandlerId {
+        self.event_handlers.add_app(handler)
+    }
+
+    /// Remove an event handler created through this application context.
+    pub fn remove_event_handler(&self, id: EventHandlerId) {
+        self.event_handlers.remove(id)
+    }
 }
 
 /// Native-window state exposed through [`DesktopContext`](crate::DesktopContext).
 ///
-/// Dereferences to the underlying [`tao::window::Window`], so window-manipulation methods such as
+/// Dereferences to the underlying native window, so window-manipulation methods such as
 /// `set_minimized`, `set_resizable`, or `request_redraw` can be called directly on a
 /// [`DesktopContext`](crate::DesktopContext).
 pub struct DesktopWindowContext {
     /// The underlying webview handle.
     pub webview: WebView,
 
-    /// The native window handle.
-    pub window: Arc<Window>,
+    #[cfg(target_os = "linux")]
+    _gtk_teardown: GtkTeardown,
+
+    /// The Winit window handle used by supported desktop hosts.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub window: Arc<dyn winit::window::Window>,
+
+    /// The Tao window retained by the current mobile host.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub window: Arc<tao::window::Window>,
     pub(crate) target_id: RenderTargetId,
     pub(crate) asset_handlers: AssetHandlerRegistry,
     pub(crate) file_hover: NativeFileHover,
@@ -104,7 +147,7 @@ pub struct DesktopWindowContext {
 impl DesktopWindowContext {
     pub(crate) fn new(
         webview: WebView,
-        window: Arc<Window>,
+        window: Arc<HostWindow>,
         target_id: RenderTargetId,
         asset_handlers: AssetHandlerRegistry,
         file_hover: NativeFileHover,
@@ -112,6 +155,8 @@ impl DesktopWindowContext {
     ) -> Self {
         Self {
             webview,
+            #[cfg(target_os = "linux")]
+            _gtk_teardown: GtkTeardown,
             window,
             target_id,
             asset_handlers,
@@ -167,12 +212,36 @@ impl DesktopWindowContext {
     }
 }
 
-/// Expose the underlying native window so its [`tao`] methods can be called directly on a
+/// Drains deferred GTK widget destruction after Wry's WebView is dropped and
+/// before Winit destroys the X11 host window.
+#[cfg(target_os = "linux")]
+struct GtkTeardown;
+
+#[cfg(target_os = "linux")]
+impl Drop for GtkTeardown {
+    fn drop(&mut self) {
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+    }
+}
+
+/// Expose the underlying native window so its windowing methods can be called directly on a
 /// [`DesktopContext`](crate::DesktopContext).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl std::ops::Deref for DesktopWindowContext {
-    type Target = Window;
+    type Target = dyn winit::window::Window;
 
     fn deref(&self) -> &Self::Target {
-        &self.window
+        self.window.as_ref()
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+impl std::ops::Deref for DesktopWindowContext {
+    type Target = tao::window::Window;
+
+    fn deref(&self) -> &Self::Target {
+        self.window.as_ref()
     }
 }

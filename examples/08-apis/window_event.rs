@@ -7,16 +7,16 @@
 //! - toggle window decorations
 //! - change the window title
 //!
-//! The entire featuresuite of wry and tao is available to you
+//! The Winit window API and Wry WebView API remain available for lower-level integration.
 
-use dioxus::desktop::{Config, WindowBuilder, window};
+use dioxus::desktop::{Config, WindowAttributes, window, winit::window::WindowLevel};
 use dioxus::prelude::*;
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
             Config::new().with_window(
-                WindowBuilder::new()
+                WindowAttributes::default()
                     .with_title("Borderless Window")
                     .with_decorations(false),
             ),
@@ -93,7 +93,11 @@ fn SetOnTop() -> Element {
                 class: "inline-flex items-center text-white bg-green-500 border-0 py-1 px-3 hover:bg-green-700 rounded",
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: move |_| {
-                    window().set_always_on_top(!always_on_top());
+                    window().set_window_level(if always_on_top() {
+                        WindowLevel::Normal
+                    } else {
+                        WindowLevel::AlwaysOnTop
+                    });
                     always_on_top.toggle();
                 },
                 "Always On Top"

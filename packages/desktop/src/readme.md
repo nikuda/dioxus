@@ -6,7 +6,12 @@ Render the Dioxus VirtualDom using the platform's native WebView implementation.
 
 One of Dioxus' flagship features is the ability to quickly build a native desktop app that looks and feels the same across platforms. Apps built with Dioxus are typically <5mb in size and use existing system resources, so they won't hog extreme amounts of RAM or memory.
 
-Dioxus Desktop is built off Tauri. Right now there aren't any Dioxus abstractions over the menubar, handling, etc, so you'll want to leverage Tauri - mostly [Wry](http://github.com/tauri-apps/wry/) and [Tao](http://github.com/tauri-apps/tao) directly. An upcoming release of Dioxus-Desktop will include components and hooks for notifications, global shortcuts, menubar, etc.
+Dioxus Desktop uses [Winit](https://github.com/rust-windowing/winit) for its
+desktop window and event-loop host and [Wry](https://github.com/tauri-apps/wry)
+for the system WebView. Android and iOS temporarily retain their existing
+[Tao](https://github.com/tauri-apps/tao) host. Dioxus provides
+backend-neutral application and window events for shared code, with explicit
+Winit and Tao hooks when direct host access is needed.
 
 ## Getting Set up
 
@@ -29,9 +34,22 @@ Edit your `main.rs`:
 ```rust, ignore
 // main.rs
 use dioxus::prelude::*;
+use dioxus_desktop::Config;
 
 fn main() {
-    dioxus_desktop::launch(app);
+    let config = Config::new();
+    #[cfg(target_os = "linux")]
+    // SAFETY: this is the process entry point, before application threads or
+    // GTK/Winit/WebKit initialization.
+    let config = unsafe {
+        config
+            .prepare_linux_host()
+            .expect("prepare the Dioxus Desktop Linux host")
+    };
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(app);
 }
 
 fn app() -> Element {

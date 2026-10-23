@@ -1,7 +1,6 @@
-use crate::ipc::UserWindowEvent;
+use crate::{commands::DesktopEventLoopProxy, ipc::UserWindowEvent};
 use futures_util::task::ArcWake;
 use std::sync::Arc;
-use tao::event_loop::EventLoopProxy;
 
 /// Create a waker that schedules VDOM polling on the event loop.
 ///
@@ -9,9 +8,9 @@ use tao::event_loop::EventLoopProxy;
 ///
 /// All IO and multithreading lives on other threads. Thanks to tokio's work stealing approach, the main thread can never
 /// claim a task while it's blocked by the event loop.
-pub fn create_dom_waker(proxy: EventLoopProxy<UserWindowEvent>) -> std::task::Waker {
+pub fn create_dom_waker(proxy: DesktopEventLoopProxy) -> std::task::Waker {
     struct DomHandle {
-        proxy: EventLoopProxy<UserWindowEvent>,
+        proxy: DesktopEventLoopProxy,
     }
 
     // this should be implemented by most platforms, but ios is missing this until

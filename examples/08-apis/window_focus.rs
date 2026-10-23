@@ -1,13 +1,10 @@
-//! Listen for window focus events using a wry event handler
+//! Listen for window focus events using the backend-neutral window event hook.
 //!
-//! This example shows how to use the use_wry_event_handler hook to listen for window focus events.
-//! We can intercept any Wry event, but in this case we're only interested in the WindowEvent::Focused event.
+//! This example shows how to use the Dioxus window event hook to listen for focus changes.
 //!
 //! This lets you do things like backgrounding tasks, pausing animations, or changing the UI when the window is focused or not.
 
-use dioxus::desktop::tao::event::Event as WryEvent;
-use dioxus::desktop::tao::event::WindowEvent;
-use dioxus::desktop::use_wry_event_handler;
+use dioxus::desktop::{WindowEvent, use_window_event_handler};
 use dioxus::prelude::*;
 
 fn main() {
@@ -17,13 +14,9 @@ fn main() {
 fn app() -> Element {
     let mut focused = use_signal(|| true);
 
-    use_wry_event_handler(move |event, _| {
-        if let WryEvent::WindowEvent {
-            event: WindowEvent::Focused(new_focused),
-            ..
-        } = event
-        {
-            focused.set(*new_focused)
+    use_window_event_handler(move |event, _| {
+        if let WindowEvent::Focused(new_focused) = event {
+            focused.set(new_focused)
         }
     });
 

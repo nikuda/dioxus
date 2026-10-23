@@ -1,7 +1,7 @@
 //! This example shows how to create a popup window and send data back to the parent window.
 //! The app root is headless and owns each native window explicitly.
 
-use dioxus::desktop::{Config, WindowBuilder, WindowConfig};
+use dioxus::desktop::{Config, WindowAttributes, WindowConfig};
 use dioxus::prelude::*;
 
 #[derive(Store, PartialEq, Clone, Debug, Default)]
@@ -31,7 +31,7 @@ fn app() -> Element {
         if inbox_open() {
             Window {
                 config: WindowConfig::new().with_window(
-                    WindowBuilder::new().with_title("Inbox")
+                    WindowAttributes::default().with_title("Inbox")
                 ),
                 onclose: move |_| inbox_open.set(false),
                 Inbox {
@@ -44,7 +44,7 @@ fn app() -> Element {
             Window {
                 key: "{id}",
                 config: WindowConfig::new().with_window(
-                    WindowBuilder::new().with_title(format!("Compose {id}"))
+                    WindowAttributes::default().with_title(format!("Compose {id}"))
                 ),
                 onclose: move |_| compose_windows.write().retain(|window_id| *window_id != id),
                 Popup { mail }

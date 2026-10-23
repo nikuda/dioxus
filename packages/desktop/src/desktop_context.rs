@@ -1,10 +1,11 @@
 use crate::{
-    AssetRequest, WindowCloseBehaviour, WindowConfig, WryEventHandler,
+    AssetRequest, EventHandlerId, WindowCloseBehaviour, WindowConfig, WindowEvent,
     assets::AssetHandlerRegistry,
     desktop_state::{DesktopAppContext, DesktopWindowContext, WindowCloseRequestResult},
     file_upload::NativeFileHover,
     ipc::UserWindowEvent,
     shortcut::{HotKey, HotKeyState, ShortcutHandle, ShortcutRegistryError},
+    windowing::{HostWindow, WindowId},
 };
 use dioxus_core::{Callback, RenderTargetId};
 use std::{
@@ -14,12 +15,15 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
-use tao::{
-    event::Event,
-    event_loop::EventLoopWindowTarget,
-    window::{Fullscreen as WryFullscreen, Window, WindowId},
-};
 use wry::{RequestAsyncResponder, WebView};
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::WinitEvent;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use winit::monitor::Fullscreen as WryFullscreen;
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use tao::{event::Event, event_loop::EventLoopWindowTarget, window::Fullscreen as WryFullscreen};
 
 #[cfg(target_os = "ios")]
 use objc2::rc::Retained;
@@ -52,8 +56,8 @@ pub fn app() -> Rc<DesktopAppContext> {
 pub type DesktopContext = Rc<DesktopService>;
 
 /// A weak handle to the [`DesktopService`] to ensure safe passing.
-/// The problem without this is that the tao window is never dropped and therefore cannot be closed.
-/// This was due to the Rc that had still references because of multiple copies when creating a webview.
+/// This prevents extra strong references from keeping the native window alive
+/// after its WebView should close.
 pub type WeakDesktopContext = Weak<DesktopService>;
 
 /// Registration for a component-owned desktop window.
@@ -116,7 +120,7 @@ impl std::ops::Deref for DesktopService {
 impl DesktopService {
     pub(crate) fn new(
         webview: WebView,
-        window: Arc<Window>,
+        window: Arc<HostWindow>,
         app: Rc<DesktopAppContext>,
         target_id: RenderTargetId,
         asset_handlers: AssetHandlerRegistry,
@@ -134,10 +138,6 @@ impl DesktopService {
                 close_behaviour,
             ),
         }
-    }
-
-    pub(crate) fn app_context(&self) -> &Rc<DesktopAppContext> {
-        &self.app
     }
 
     pub(crate) fn register_component_window(
@@ -273,25 +273,50 @@ impl DesktopService {
         tracing::warn!("Devtools are disabled in release builds");
     }
 
-    /// Create a wry event handler that listens for wry events.
-    /// This event handler is scoped to the currently active window and will only receive events that are either global or related to the current window.
+    /// Create a semantic event handler scoped to this window.
     ///
-    /// The id this function returns can be used to remove the event handler with [`Self::remove_wry_event_handler`]
-    pub fn create_wry_event_handler(
+    /// The returned id can be used with [`Self::remove_event_handler`].
+    pub fn create_window_event_handler(
         &self,
-        handler: impl FnMut(&Event<UserWindowEvent>, &EventLoopWindowTarget<UserWindowEvent>) + 'static,
-    ) -> WryEventHandler {
-        self.app.event_handlers.add(self.window.id(), handler)
+        handler: impl FnMut(WindowEvent, &Rc<DesktopAppContext>) + 'static,
+    ) -> EventHandlerId {
+        self.app
+            .event_handlers
+            .add_window(self.window.id(), handler)
     }
 
-    /// Remove a wry event handler created with [`Self::create_wry_event_handler`]
-    pub fn remove_wry_event_handler(&self, id: WryEventHandler) {
+    /// Create a raw Winit event handler scoped to this window.
+    ///
+    /// Application-wide events are delivered to every registered handler;
+    /// window events are filtered to this window. The returned id can be used
+    /// with [`Self::remove_event_handler`].
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn create_winit_event_handler(
+        &self,
+        handler: impl for<'a> FnMut(WinitEvent<'a>, &Rc<DesktopAppContext>) + 'static,
+    ) -> EventHandlerId {
+        self.app.event_handlers.add_winit(self.window.id(), handler)
+    }
+
+    /// Create a raw mobile Tao event handler scoped to this window.
+    ///
+    /// The returned id can be used with [`Self::remove_event_handler`].
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn create_tao_event_handler(
+        &self,
+        handler: impl FnMut(&Event<UserWindowEvent>, &EventLoopWindowTarget<UserWindowEvent>) + 'static,
+    ) -> EventHandlerId {
+        self.app.event_handlers.add_tao(self.window.id(), handler)
+    }
+
+    /// Remove an event handler created through this desktop context.
+    pub fn remove_event_handler(&self, id: EventHandlerId) {
         self.app.event_handlers.remove(id)
     }
 
     /// Create a global shortcut
     ///
-    /// Linux: Only works on x11. See [this issue](https://github.com/tauri-apps/tao/issues/331) for more information.
+    /// Linux: Only works on X11, including an XWayland session.
     pub fn create_shortcut(
         &self,
         hotkey: HotKey,

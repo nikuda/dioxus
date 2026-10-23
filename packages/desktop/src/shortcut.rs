@@ -19,7 +19,10 @@ use crate::window;
 use dioxus_html::input_data::keyboard_types::Modifiers;
 use slab::Slab;
 use std::{cell::RefCell, collections::HashMap, rc::Rc, str::FromStr};
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use tao::keyboard::ModifiersState;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use winit::keyboard::ModifiersState;
 
 /// An global id for a shortcut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,7 +177,12 @@ impl IntoModifiersState for ModifiersState {
         if self.alt_key() {
             modifiers |= Modifiers::ALT;
         }
-        if self.super_key() {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let meta_key = self.meta_key();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let meta_key = self.super_key();
+
+        if meta_key {
             modifiers |= Modifiers::META;
         }
 
@@ -298,7 +306,7 @@ impl IntoKeyCode for dioxus_html::KeyCode {
             dioxus_html::KeyCode::CloseBracket => Code::BracketRight,
             dioxus_html::KeyCode::SingleQuote => Code::Quote,
             key => panic!(
-                "Failed to convert {key:?} to tao::keyboard::KeyCode, try using tao::keyboard::KeyCode directly"
+                "Failed to convert {key:?} to a global-hotkey key code, try using global_hotkey::hotkey::Code directly"
             ),
         }
     }

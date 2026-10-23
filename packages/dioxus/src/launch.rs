@@ -266,7 +266,7 @@ impl LaunchBuilder {
     /// # Example
     /// ```rust, no_run
     /// use dioxus::prelude::*;
-    /// use dioxus_desktop::{Config, WindowBuilder};
+    /// use dioxus_desktop::{Config, WindowAttributes};
     ///
     /// fn app() -> Element {
     ///     rsx! {
@@ -277,7 +277,7 @@ impl LaunchBuilder {
     /// dioxus::LaunchBuilder::new()
     ///    .with_cfg(desktop! {
     ///        Config::new().with_window(
-    ///            WindowBuilder::new()
+    ///            WindowAttributes::default()
     ///                .with_title("My App")
     ///        )
     ///     })

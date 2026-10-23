@@ -3,7 +3,7 @@
 //! This example shows how to implement a simple multiwindow application using dioxus.
 //! The app root owns each native window explicitly.
 
-use dioxus::desktop::{Config, WindowBuilder, WindowConfig};
+use dioxus::desktop::{Config, WindowAttributes, WindowConfig};
 use dioxus::prelude::*;
 
 fn main() {
@@ -24,7 +24,7 @@ fn app() -> Element {
             Window {
                 key: "{id}",
                 config: WindowConfig::new().with_window(
-                    WindowBuilder::new().with_title(format!("Window {id}"))
+                    WindowAttributes::default().with_title(format!("Window {id}"))
                 ),
                 onclose: move |_| window_state.close_window(id),
                 AppWindow { id, window_state }

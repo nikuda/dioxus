@@ -1,11 +1,11 @@
-use crate::{
-    Config, WindowConfig,
-    app::App,
-    ipc::{IpcMethod, UserWindowEvent},
-};
+use crate::{Config, WindowConfig, app::App};
 use dioxus_core::*;
 use dioxus_core_macro::rsx;
 use std::{any::Any, cell::RefCell, rc::Rc};
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use crate::ipc::{IpcMethod, UserWindowEvent};
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use tao::event::{Event, StartCause, WindowEvent};
 
 #[derive(Clone, dioxus_core_macro::Props)]
@@ -55,21 +55,41 @@ fn WindowedRoot(props: DesktopRootProps) -> Element {
 /// [`launch`] or `dioxus::LaunchBuilder::desktop().launch(...)` for the
 /// normal API that wraps the user component in a default window.
 ///
+/// On Linux, `desktop_config` must first pass through
+/// [`Config::prepare_linux_host`] at the process entry point, before starting
+/// application threads.
+///
 /// This will block the main thread, and *must* be spawned on the main thread. This function does not assume any runtime
 /// and is equivalent to calling launch_with_props with the tokio feature disabled.
-pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: Config) -> ! {
-    let mut custom_event_handler = desktop_config.custom_event_handler.take();
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, desktop_config: Config) -> ! {
+    let (event_loop, app) = App::new(desktop_config, virtual_dom).unwrap_or_else(|error| {
+        eprintln!("failed to start Dioxus Desktop: {error}");
+        std::process::exit(1)
+    });
+
+    #[cfg(target_os = "linux")]
+    crate::linux_host::run(event_loop, app);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Err(error) = event_loop.run_app(app) {
+            eprintln!("Dioxus Desktop's Winit event loop failed: {error}");
+            std::process::exit(1)
+        }
+        std::process::exit(0)
+    }
+}
+
+/// Run a desktop [`VirtualDom`] through the retained mobile Tao host.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, desktop_config: Config) -> ! {
     let (event_loop, mut app) = App::new(desktop_config, virtual_dom);
 
-    event_loop.run(move |window_event, event_loop, control_flow| {
-        // Set the control flow and check if any events need to be handled in the app itself
-        app.tick(&window_event);
+    event_loop.run(move |event, event_loop, control_flow| {
+        app.tick(&event);
 
-        if let Some(ref mut f) = custom_event_handler {
-            f(&window_event, event_loop)
-        }
-
-        match window_event {
+        match event {
             Event::NewEvents(StartCause::Init) => app.handle_start_cause_init(),
             Event::LoopDestroyed => app.handle_loop_destroyed(),
             Event::WindowEvent {
@@ -77,60 +97,40 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
             } => match event {
                 WindowEvent::CloseRequested => app.handle_close_requested(window_id),
                 WindowEvent::Destroyed { .. } => app.window_destroyed(window_id),
-                WindowEvent::Resized(new_size) => app.resize_window(window_id, new_size),
+                WindowEvent::Resized(size) => app.resize_window(window_id, size),
                 _ => {}
             },
-
             Event::UserEvent(event) => match event {
                 UserWindowEvent::Poll => app.poll_vdom(),
                 UserWindowEvent::NewWindow => app.handle_new_window(),
                 UserWindowEvent::RequestWindowClose(id) => app.handle_close_requested(id),
                 UserWindowEvent::DestroyWindow(id) => app.destroy_window(id),
-                UserWindowEvent::Shutdown => app.control_flow = tao::event_loop::ControlFlow::Exit,
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::GlobalHotKeyEvent(evnt) => app.handle_global_hotkey(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::MudaMenuEvent(evnt) => app.handle_menu_event(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::TrayMenuEvent(evnt) => app.handle_tray_menu_event(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::TrayIconEvent(evnt) => app.handle_tray_icon_event(evnt),
-
+                UserWindowEvent::Shutdown => app.request_exit(),
                 #[cfg(all(feature = "devtools", debug_assertions))]
                 UserWindowEvent::HotReloadEvent(msg) => app.handle_hot_reload_msg(msg),
-
-                // Windows-only drag-n-drop fix events. We need to call the interpreter drag-n-drop code.
                 UserWindowEvent::WindowsDragDrop(id) => {
-                    if let Some(app_webview) = app.webviews.get(&id) {
-                        _ = app_webview
+                    if let Some(webview) = app.webviews.get(&id) {
+                        _ = webview
                             .desktop_context
                             .webview
                             .evaluate_script("window.interpreter.handleWindowsDragDrop();");
                     }
                 }
                 UserWindowEvent::WindowsDragLeave(id) => {
-                    if let Some(app_webview) = app.webviews.get(&id) {
-                        _ = app_webview
+                    if let Some(webview) = app.webviews.get(&id) {
+                        _ = webview
                             .desktop_context
                             .webview
                             .evaluate_script("window.interpreter.handleWindowsDragLeave();");
                     }
                 }
-                UserWindowEvent::WindowsDragOver(id, x_pos, y_pos) => {
-                    if let Some(app_webview) = app.webviews.get(&id) {
-                        _ = app_webview
-                            .desktop_context
-                            .webview
-                            .evaluate_script(&format!(
-                                "window.interpreter.handleWindowsDragOver({x_pos}, {y_pos});"
-                            ));
+                UserWindowEvent::WindowsDragOver(id, x, y) => {
+                    if let Some(webview) = app.webviews.get(&id) {
+                        _ = webview.desktop_context.webview.evaluate_script(&format!(
+                            "window.interpreter.handleWindowsDragOver({x}, {y});"
+                        ));
                     }
                 }
-
                 UserWindowEvent::Ipc { id, msg } => match msg.method() {
                     IpcMethod::Initialize => app.handle_initialize_msg(id),
                     IpcMethod::UserEvent => {}
@@ -138,11 +138,19 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                     IpcMethod::BrowserOpen => app.handle_browser_open(msg),
                     IpcMethod::Other(_) => {}
                 },
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::GlobalHotKeyEvent(_) => {}
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::MudaMenuEvent(_) => {}
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::TrayMenuEvent(_) => {}
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::TrayIconEvent(_) => {}
             },
             _ => {}
         }
 
-        *control_flow = app.control_flow;
+        *control_flow = app.control_flow();
     })
 }
 
@@ -200,6 +208,8 @@ pub fn launch_virtual_dom(virtual_dom: VirtualDom, desktop_config: Config) -> ! 
 ///
 /// By default, this wraps the user component in a default [`Window`](crate::Window). Set
 /// [`Config::with_headless_root`] to run the root component without an implicit window.
+/// On Linux, pass a [`Config`] prepared with [`Config::prepare_linux_host`]
+/// through the launch builder before starting application threads.
 pub fn launch(
     root: fn() -> Element,
     contexts: Vec<Box<dyn Fn() -> Box<dyn Any> + Send + Sync>>,

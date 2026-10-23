@@ -120,10 +120,13 @@ impl DioxusIconTrait for DioxusMenuIcon {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use tao::window::Icon;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use winit::icon::{Icon, RgbaIcon};
 
 #[cfg(target_os = "windows")]
-use tao::platform::windows::IconExtWindows;
+use winit::platform::windows::WinIcon;
 
 impl DioxusIconTrait for Icon {
     fn get_icon() -> Result<Self>
@@ -131,9 +134,20 @@ impl DioxusIconTrait for Icon {
         Self: Sized,
     {
         #[cfg(target_os = "windows")]
-        if let Ok(icon) = Icon::from_resource(32512, None) {
-            return Ok(icon);
+        if let Ok(icon) = WinIcon::from_resource(32512, None) {
+            return Ok(Icon::from(icon));
         }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        return RgbaIcon::new(
+            FALLBACK_ICON_RGBA.to_vec(),
+            FALLBACK_ICON_WIDTH,
+            FALLBACK_ICON_HEIGHT,
+        )
+        .map(Icon::from)
+        .map_err(Into::into);
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         Icon::from_rgba(
             FALLBACK_ICON_RGBA.to_vec(),
             FALLBACK_ICON_WIDTH,
@@ -147,6 +161,12 @@ impl DioxusIconTrait for Icon {
         Self: Sized,
     {
         let (icon, width, height) = load_image_from_memory(value)?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        return RgbaIcon::new(icon, width, height)
+            .map(Icon::from)
+            .map_err(Into::into);
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         Icon::from_rgba(icon, width, height).map_err(Into::into)
     }
 
@@ -155,6 +175,18 @@ impl DioxusIconTrait for Icon {
         Self: Sized,
     {
         let (img, width, height) = load_image_from_path(path)?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        return if let Some((width, height)) = size {
+            RgbaIcon::new(img, width, height)
+                .map(Icon::from)
+                .map_err(Into::into)
+        } else {
+            RgbaIcon::new(img, width, height)
+                .map(Icon::from)
+                .map_err(Into::into)
+        };
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if let Some((width, height)) = size {
             Ok(Icon::from_rgba(img, width, height)?)
         } else {

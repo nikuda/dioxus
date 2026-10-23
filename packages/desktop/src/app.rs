@@ -1,10 +1,24 @@
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[path = "app_tao.rs"]
+mod app_tao;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[path = "app_winit.rs"]
+mod app_winit;
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use app_tao as host;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use app_winit as host;
+
 use crate::{
+    AppEvent, WindowEvent,
     config::{Config, WindowCloseBehaviour},
     desktop_state::{DesktopAppContext, WindowCloseRequestResult},
+    event_handlers::AppEventCallback,
     ipc::{IpcMessage, UserWindowEvent},
     query::QueryResult,
-    waker::create_dom_waker,
     webview::WebviewInstance,
+    windowing::{PhysicalSize, WindowId, surface_size},
 };
 use dioxus_core::{RenderTargetId, ScopeId, VirtualDom, provide_context};
 use futures_util::{FutureExt, pin_mut};
@@ -13,12 +27,6 @@ use std::{
     rc::Rc,
     task::Waker,
     time::Duration,
-};
-use tao::{
-    dpi::PhysicalSize,
-    event::Event,
-    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
-    window::WindowId,
 };
 
 /// The single top-level object that manages the event loop, VirtualDom, and running windows.
@@ -32,136 +40,58 @@ pub(crate) struct App {
     #[cfg(all(feature = "devtools", debug_assertions))]
     pub(crate) pending_hot_reload_msgs: Vec<dioxus_devtools::DevserverMsg>,
 
-    // Stuff we need mutable access to
-    pub(crate) control_flow: ControlFlow,
     pub(crate) exit_on_last_window_close: bool,
-    pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
-    pub(crate) float_all: bool,
-    pub(crate) show_devtools: bool,
-    pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) dom_waker: Waker,
+    pub(crate) app_event_handler: Option<AppEventCallback>,
+    host: host::State,
 
     /// App-wide state shared by every desktop window.
     pub(crate) app_context: Rc<DesktopAppContext>,
 }
 
 impl App {
-    pub fn new(mut cfg: Config, virtual_dom: VirtualDom) -> (EventLoop<UserWindowEvent>, Self) {
-        let event_loop = cfg
-            .event_loop
-            .take()
-            .unwrap_or_else(|| EventLoopBuilder::<UserWindowEvent>::with_user_event().build());
-
-        let tray_icon_show_window_on_click = cfg.tray_icon_show_window_on_click;
-        let proxy = event_loop.create_proxy();
-        let dom_waker = create_dom_waker(proxy.clone());
-
+    fn from_host(
+        mut cfg: Config,
+        virtual_dom: VirtualDom,
+        dom_waker: Waker,
+        app_context: Rc<DesktopAppContext>,
+        host: host::State,
+    ) -> Self {
         let app = Self {
             exit_on_last_window_close: cfg.exit_on_last_window_close,
-            disable_dma_buf_on_wayland: cfg.disable_dma_buf_on_wayland,
             webviews: HashMap::new(),
-            control_flow: ControlFlow::Wait,
             dom: virtual_dom,
             initial_dom_rebuild_done: false,
             #[cfg(all(feature = "devtools", debug_assertions))]
             pending_hot_reload_msgs: Vec::new(),
-            float_all: false,
-            show_devtools: false,
-            tray_icon_show_window_on_click,
             dom_waker,
-            app_context: Rc::new(DesktopAppContext::new(proxy, event_loop.clone())),
+            app_event_handler: cfg.app_event_handler.take(),
+            host,
+            app_context,
         };
 
-        // Set the event converter
         dioxus_html::set_event_converter(Box::new(crate::events::SerializedHtmlEventConverter));
-
-        // Wire up the global hotkey handler
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-        app.set_global_hotkey_handler();
-
-        // Wire up the menubar receiver - this way any component can key into the menubar actions
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-        app.set_menubar_receiver();
-
-        // Wire up the tray icon receiver - this way any component can key into the menubar actions
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-        app.set_tray_icon_receiver();
-
-        // Allow hotreloading to work - but only in debug mode
         #[cfg(all(feature = "devtools", debug_assertions))]
         app.connect_hotreload();
-
-        #[cfg(debug_assertions)]
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-        app.connect_preserve_window_state_handler();
-
-        // Make sure to disable DMA buffer rendering on Linux Wayland sessions
-        app.disable_dma_buf();
-
-        (event_loop, app)
+        app
     }
 
-    pub fn tick(&mut self, window_event: &Event<'_, UserWindowEvent>) {
-        self.control_flow = ControlFlow::Wait;
+    fn dispatch_app_event(&mut self, event: AppEvent) {
         self.app_context
             .event_handlers
-            .apply_event(window_event, &self.app_context.target);
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    pub fn handle_global_hotkey(&self, event: global_hotkey::GlobalHotKeyEvent) {
-        self.app_context.shortcut_manager.call_handlers(event);
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    pub fn handle_menu_event(&mut self, event: muda::MenuEvent) {
-        match event.id().0.as_str() {
-            "dioxus-float-top" => {
-                for app_webview in self.webviews.values() {
-                    app_webview
-                        .desktop_context
-                        .window
-                        .set_always_on_top(self.float_all);
-                }
-                self.float_all = !self.float_all;
-            }
-            "dioxus-toggle-dev-tools" => {
-                self.show_devtools = !self.show_devtools;
-                for app_webview in self.webviews.values() {
-                    let wv = &app_webview.desktop_context.webview;
-                    if self.show_devtools {
-                        wv.open_devtools();
-                    } else {
-                        wv.close_devtools();
-                    }
-                }
-            }
-            _ => (),
+            .apply_app(event, &self.app_context);
+        if let Some(mut handler) = self.app_event_handler.take() {
+            let app_context = self.app_context.clone();
+            self.dom.in_runtime(|| handler(event, &app_context));
+            self.app_event_handler = Some(handler);
         }
     }
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    pub fn handle_tray_menu_event(&mut self, event: tray_icon::menu::MenuEvent) {
-        _ = event;
-    }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    pub fn handle_tray_icon_event(&mut self, event: tray_icon::TrayIconEvent) {
-        if let tray_icon::TrayIconEvent::Click {
-            id: _,
-            position: _,
-            rect: _,
-            button,
-            button_state: _,
-        } = event
-        {
-            if button == tray_icon::MouseButton::Left && self.tray_icon_show_window_on_click {
-                for app_webview in self.webviews.values() {
-                    app_webview.desktop_context.window.set_visible(true);
-                    app_webview.desktop_context.window.set_focus();
-                }
-            }
-        }
+    fn dispatch_window_event(&mut self, window_id: WindowId, event: WindowEvent) {
+        self.app_context
+            .event_handlers
+            .apply_window(window_id, event, &self.app_context);
     }
 
     #[cfg(all(feature = "devtools", debug_assertions))]
@@ -170,14 +100,6 @@ impl App {
         dioxus_devtools::connect(move |msg| {
             _ = proxy.send_event(UserWindowEvent::HotReloadEvent(msg));
         })
-    }
-
-    pub fn handle_new_window(&mut self) {
-        for pending_webview in self.app_context.drain_pending_webviews() {
-            let app_webview = pending_webview.create_window(&mut self.dom, &self.app_context);
-            let id = app_webview.desktop_context.window.id();
-            self.webviews.insert(id, app_webview);
-        }
     }
 
     pub fn handle_close_requested(&mut self, id: WindowId) {
@@ -226,7 +148,7 @@ impl App {
         self.dom.runtime().remove_render_target(target_id);
 
         if self.exit_on_last_window_close && self.webviews.is_empty() {
-            self.control_flow = ControlFlow::Exit
+            self.request_exit();
         } else {
             // Removing the webview drops its `WryQueue`, including any
             // `edits_in_progress` receiver that was gating `poll_vdom`. The
@@ -252,12 +174,6 @@ impl App {
                 )),
             });
         }
-    }
-
-    pub fn handle_start_cause_init(&mut self) {
-        self.provide_app_context();
-        self.rebuild_dom();
-        self.handle_new_window();
     }
 
     fn provide_app_context(&mut self) {
@@ -406,7 +322,7 @@ impl App {
                 false,
             ),
             DevserverMsg::Shutdown => {
-                self.control_flow = ControlFlow::Exit;
+                self.request_exit();
             }
             _ => {}
         }
@@ -538,55 +454,6 @@ impl App {
         has_pending_edits
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    fn set_global_hotkey_handler(&self) {
-        let receiver = self.app_context.proxy.clone();
-
-        // The event loop becomes the hotkey receiver
-        // This means we don't need to poll the receiver on every tick - we just get the events as they come in
-        // This is a bit more efficient than the previous implementation, but if someone else sets a handler, the
-        // receiver will become inert.
-        global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(move |t| {
-            // todo: should we unset the event handler when the app shuts down?
-            _ = receiver.send_event(UserWindowEvent::GlobalHotKeyEvent(t));
-        }));
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    fn set_menubar_receiver(&self) {
-        let receiver = self.app_context.proxy.clone();
-
-        // The event loop becomes the menu receiver
-        // This means we don't need to poll the receiver on every tick - we just get the events as they come in
-        // This is a bit more efficient than the previous implementation, but if someone else sets a handler, the
-        // receiver will become inert.
-        muda::MenuEvent::set_event_handler(Some(move |t| {
-            // todo: should we unset the event handler when the app shuts down?
-            _ = receiver.send_event(UserWindowEvent::MudaMenuEvent(t));
-        }));
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    fn set_tray_icon_receiver(&self) {
-        let receiver = self.app_context.proxy.clone();
-
-        // The event loop becomes the menu receiver
-        // This means we don't need to poll the receiver on every tick - we just get the events as they come in
-        // This is a bit more efficient than the previous implementation, but if someone else sets a handler, the
-        // receiver will become inert.
-        tray_icon::TrayIconEvent::set_event_handler(Some(move |t| {
-            // todo: should we unset the event handler when the app shuts down?
-            _ = receiver.send_event(UserWindowEvent::TrayIconEvent(t));
-        }));
-
-        // for whatever reason they had to make it separate
-        let receiver = self.app_context.proxy.clone();
-        tray_icon::menu::MenuEvent::set_event_handler(Some(move |t| {
-            // todo: should we unset the event handler when the app shuts down?
-            _ = receiver.send_event(UserWindowEvent::TrayMenuEvent(t));
-        }));
-    }
-
     /// Do our best to preserve state about the window when the event loop is destroyed
     ///
     /// This will attempt to save the window position, size, and monitor into the environment before
@@ -616,17 +483,12 @@ impl App {
                 (position.x, position.y)
             };
 
+            let size = surface_size(window.as_ref());
+
             let (width, height) = if cfg!(target_os = "macos") {
-                let size = window.outer_size();
                 let size = size.to_logical::<u32>(window.scale_factor());
-                // This is to work around a bug in how tao handles inner_size on macOS
-                // We *want* to use inner_size, but that's currently broken, so we use outer_size instead and then an adjustment
-                //
-                // https://github.com/tauri-apps/tao/issues/889
-                let adjustment = if window.is_decorated() { 28 } else { 0 };
-                (size.width, size.height.saturating_sub(adjustment))
+                (size.width, size.height)
             } else {
-                let size = window.inner_size();
                 (size.width, size.height)
             };
 
@@ -646,54 +508,6 @@ impl App {
             if let Ok(state) = serde_json::to_string(&state) {
                 _ = std::fs::write(restore_file(), state);
             }
-        }
-    }
-
-    /// Wire up a receiver to sigkill that lets us preserve the window state
-    /// Whenever sigkill is sent, we shut down the app and save the window state
-    #[cfg(debug_assertions)]
-    fn connect_preserve_window_state_handler(&self) {
-        // TODO: make this work on windows
-        #[cfg(unix)]
-        {
-            // Wire up the trap
-            let target = self.app_context.proxy.clone();
-            std::thread::spawn(move || {
-                use signal_hook::consts::{SIGINT, SIGTERM};
-                let sigkill = signal_hook::iterator::Signals::new([SIGTERM, SIGINT]);
-                if let Ok(mut sigkill) = sigkill {
-                    for _ in sigkill.forever() {
-                        if target.send_event(UserWindowEvent::Shutdown).is_err() {
-                            std::process::exit(0);
-                        }
-
-                        // give it a moment for the event to be processed
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-            });
-        }
-    }
-
-    /// Disable DMA buffer rendering on Linux Wayland sessions to avoid bugs with WebKitGTK
-    fn disable_dma_buf(&self) {
-        if cfg!(target_os = "linux") && self.disable_dma_buf_on_wayland {
-            static INIT: std::sync::Once = std::sync::Once::new();
-            INIT.call_once(|| {
-                if std::path::Path::new("/dev/dri").exists()
-                    && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland"
-                {
-                    // Gnome Webkit is currently buggy under Wayland and KDE, so we will run it with XWayland mode.
-                    // See: https://github.com/DioxusLabs/dioxus/issues/3667
-                    unsafe {
-                        // Disable explicit sync for NVIDIA drivers on Linux when using Way
-                        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-                    }
-                }
-                unsafe {
-                    std::env::set_var("GDK_BACKEND", "x11");
-                }
-            });
         }
     }
 }

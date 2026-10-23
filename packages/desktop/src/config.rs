@@ -1,24 +1,33 @@
 use dioxus_core::{LaunchConfig, VirtualDom};
 use std::path::PathBuf;
 use std::{borrow::Cow, sync::Arc};
-use tao::window::{Icon, WindowBuilder};
-use tao::{
-    event_loop::{EventLoop, EventLoopWindowTarget},
-    window::Window,
-};
 use wry::http::{Request as HttpRequest, Response as HttpResponse};
 use wry::{RequestAsyncResponder, WebViewId};
 
-use crate::ipc::UserWindowEvent;
 use crate::menubar::{DioxusMenu, default_menu_bar};
+use crate::windowing::HostWindow;
+use crate::{AppEvent, desktop_state::DesktopAppContext, event_handlers::AppEventCallback};
+use std::rc::Rc;
 
-type CustomEventHandler = Box<
-    dyn 'static
-        + for<'a> FnMut(
-            &tao::event::Event<'a, UserWindowEvent>,
-            &EventLoopWindowTarget<UserWindowEvent>,
-        ),
->;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::WindowAttributes;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use crate::WindowBuilder as TaoWindowBuilder;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::{WinitEvent, event_handlers::WinitEventCallback};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use winit::{event_loop::EventLoopBuilder, icon::Icon, window::WindowLevel};
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use crate::ipc::UserWindowEvent;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use tao::{
+    event_loop::{EventLoop, EventLoopWindowTarget},
+    window::Icon,
+};
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use crate::event_handlers::TaoEventCallback;
 
 /// A function taking a URL and returning whether the webview should navigate to it or open it in
 /// the browser. If missing in the config, all URLs will be allowed.
@@ -67,7 +76,10 @@ pub(crate) type AsyncWryProtocol = (
 /// window it opens. The [app-level `Config`](Config) embeds one of these to describe the window
 /// created for you by [`launch`](crate::launch::launch).
 pub struct WindowConfig {
-    pub(crate) window: WindowBuilder,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) window: WindowAttributes,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(crate) window: TaoWindowBuilder,
     pub(crate) as_child_window: bool,
     pub(crate) menu: MenuBuilderState,
     pub(crate) protocols: Vec<WryProtocol>,
@@ -86,21 +98,38 @@ pub struct WindowConfig {
     pub(crate) navigation_handler: Option<NavigationHandler>,
 
     #[allow(clippy::type_complexity)]
-    pub(crate) on_window: Option<Box<dyn FnMut(Arc<Window>, &mut VirtualDom) + 'static>>,
+    pub(crate) on_window: Option<Box<dyn FnMut(Arc<HostWindow>, &mut VirtualDom) + 'static>>,
 }
 
 impl WindowConfig {
     /// Initializes a new `WindowConfig` with default values.
     #[inline]
     pub fn new() -> Self {
-        let mut window: WindowBuilder = WindowBuilder::new()
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let mut window: WindowAttributes = WindowAttributes::default()
+            .with_title(dioxus_cli_config::app_title().unwrap_or_else(|| "Dioxus App".to_string()));
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let mut window: TaoWindowBuilder = TaoWindowBuilder::new()
             .with_title(dioxus_cli_config::app_title().unwrap_or_else(|| "Dioxus App".to_string()));
 
         // During development we want the window to be on top so we can see it while we work
         let always_on_top = dioxus_cli_config::always_on_top().unwrap_or(true);
 
         if cfg!(debug_assertions) {
-            window = window.with_always_on_top(always_on_top);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                window = window.with_window_level(if always_on_top {
+                    WindowLevel::AlwaysOnTop
+                } else {
+                    WindowLevel::Normal
+                });
+            }
+
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                window = window.with_always_on_top(always_on_top);
+            }
         }
 
         Self {
@@ -166,11 +195,26 @@ impl WindowConfig {
     }
 
     /// Set the configuration for the window.
-    pub fn with_window(mut self, window: WindowBuilder) -> Self {
-        // We need to do a swap because the window builder only takes itself as muy self
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_window(mut self, window: WindowAttributes) -> Self {
         self.window = window;
         // If the decorations are off for the window, remove the menu as well
-        if !self.window.window.decorations && matches!(self.menu, MenuBuilderState::Unset) {
+        let decorations = self.window.decorations;
+
+        if !decorations && matches!(self.menu, MenuBuilderState::Unset) {
+            self.menu = MenuBuilderState::Set(None);
+        }
+        self
+    }
+
+    /// Set the configuration for the window.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn with_window(mut self, window: TaoWindowBuilder) -> Self {
+        self.window = window;
+        // If the decorations are off for the window, remove the menu as well
+        let decorations = self.window.window.decorations;
+
+        if !decorations && matches!(self.menu, MenuBuilderState::Unset) {
             self.menu = MenuBuilderState::Set(None);
         }
         self
@@ -234,7 +278,14 @@ impl WindowConfig {
 
     /// Set a custom icon for this application
     pub fn with_icon(mut self, icon: Icon) -> Self {
-        self.window.window.window_icon = Some(icon);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            self.window.window_icon = Some(icon);
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            self.window.window.window_icon = Some(icon);
+        }
         self
     }
 
@@ -275,14 +326,13 @@ impl WindowConfig {
 
     /// Sets the menu the window will use. This will override the default menu bar.
     ///
-    /// > Note: Menu will be hidden if
-    /// > [`with_decorations`](tao::window::WindowBuilder::with_decorations)
-    /// > is set to false and passed into [`with_window`](WindowConfig::with_window)
+    /// > Note: Menu will be hidden if window decorations are disabled on the
+    /// > value passed into [`with_window`](WindowConfig::with_window).
     #[allow(unused)]
     pub fn with_menu(mut self, menu: impl Into<Option<DioxusMenu>>) -> Self {
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
-            if self.window.window.decorations {
+            if self.window.decorations {
                 self.menu = MenuBuilderState::Set(menu.into())
             }
         }
@@ -291,9 +341,26 @@ impl WindowConfig {
 
     /// Allows modifying the window and virtual dom right after they are built, but before the webview is created.
     ///
-    /// This is important for z-ordering textures in child windows. Note that this callback runs on
-    /// every window creation, so it's up to you to
-    pub fn with_on_window(mut self, f: impl FnMut(Arc<Window>, &mut VirtualDom) + 'static) -> Self {
+    /// This is important for z-ordering textures in child windows. This callback runs on every
+    /// window creation, so it must be safe to invoke more than once.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_on_window(
+        mut self,
+        f: impl FnMut(Arc<dyn winit::window::Window>, &mut VirtualDom) + 'static,
+    ) -> Self {
+        self.on_window = Some(Box::new(f));
+        self
+    }
+
+    /// Allows modifying the window and virtual dom right after they are built, but before the webview is created.
+    ///
+    /// This is important for z-ordering textures in child windows. This callback runs on every
+    /// window creation, so it must be safe to invoke more than once.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn with_on_window(
+        mut self,
+        f: impl FnMut(Arc<tao::window::Window>, &mut VirtualDom) + 'static,
+    ) -> Self {
         self.on_window = Some(Box::new(f));
         self
     }
@@ -326,9 +393,16 @@ impl Default for WindowConfig {
 /// [`WindowConfig`] directly when opening additional windows with the [`Window`](crate::Window)
 /// component.
 pub struct Config {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) event_loop_builder: Option<EventLoopBuilder>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) event_loop: Option<EventLoop<UserWindowEvent>>,
     pub(crate) exit_on_last_window_close: bool,
-    pub(crate) custom_event_handler: Option<CustomEventHandler>,
+    pub(crate) app_event_handler: Option<AppEventCallback>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) winit_event_handler: Option<WinitEventCallback>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(crate) tao_event_handler: Option<TaoEventCallback>,
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) headless_root: bool,
@@ -344,9 +418,16 @@ impl Config {
     #[inline]
     pub fn new() -> Self {
         Self {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            event_loop_builder: None,
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             event_loop: None,
             exit_on_last_window_close: true,
-            custom_event_handler: None,
+            app_event_handler: None,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            winit_event_handler: None,
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            tao_event_handler: None,
             disable_dma_buf_on_wayland: true,
             tray_icon_show_window_on_click: true,
             headless_root: false,
@@ -370,7 +451,19 @@ impl Config {
         self
     }
 
-    /// Set the event loop to be used
+    /// Set the Winit event-loop builder used by the desktop host.
+    ///
+    /// Dioxus still builds and owns the event loop. On Linux it overrides the
+    /// display backend to X11 so Winit and the current WebKitGTK host cannot
+    /// select incompatible backends.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_event_loop_builder(mut self, event_loop_builder: EventLoopBuilder) -> Self {
+        self.event_loop_builder = Some(event_loop_builder);
+        self
+    }
+
+    /// Set the event loop to be used.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub fn with_event_loop(mut self, event_loop: EventLoop<UserWindowEvent>) -> Self {
         self.event_loop = Some(event_loop);
         self
@@ -386,23 +479,76 @@ impl Config {
         self
     }
 
-    /// Sets a custom callback to run whenever the event pool receives an event.
-    pub fn with_custom_event_handler(
+    /// Sets a callback for cross-platform application lifecycle events.
+    pub fn with_app_event_handler(
+        mut self,
+        f: impl FnMut(AppEvent, &Rc<DesktopAppContext>) + 'static,
+    ) -> Self {
+        self.app_event_handler = Some(Box::new(f));
+        self
+    }
+
+    /// Sets a callback for raw desktop Winit events.
+    ///
+    /// Prefer [`Self::with_app_event_handler`] when a backend-neutral event is
+    /// sufficient.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_winit_event_handler(
+        mut self,
+        f: impl for<'a> FnMut(WinitEvent<'a>, &Rc<DesktopAppContext>) + 'static,
+    ) -> Self {
+        self.winit_event_handler = Some(Box::new(f));
+        self
+    }
+
+    /// Sets a callback at each raw mobile Tao event-loop boundary.
+    ///
+    /// Prefer [`Self::with_app_event_handler`] when a backend-neutral event is
+    /// sufficient.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn with_tao_event_handler(
         mut self,
         f: impl FnMut(&tao::event::Event<'_, UserWindowEvent>, &EventLoopWindowTarget<UserWindowEvent>)
         + 'static,
     ) -> Self {
-        self.custom_event_handler = Some(Box::new(f));
+        self.tao_event_handler = Some(Box::new(f));
         self
     }
 
     /// Set whether or not DMA-BUF usage should be disabled on Wayland.
     ///
-    /// Defaults to true to avoid issues on some systems. If you want to enable DMA-BUF usage, set this to false.
+    /// Defaults to true to avoid issues on some systems. Linux applications
+    /// must call `Config::prepare_linux_host` before they start any application
+    /// threads. A parent process may set `WEBKIT_DISABLE_DMABUF_RENDERER=1`,
+    /// but Dioxus must still prepare and validate the GTK backend.
+    ///
+    /// If you want to enable DMA-BUF usage, set this to false before calling
+    /// `Config::prepare_linux_host`.
     /// See <https://github.com/DioxusLabs/dioxus/issues/4528#issuecomment-3476430611>
     pub fn with_disable_dma_buf_on_wayland(mut self, disable: bool) -> Self {
         self.disable_dma_buf_on_wayland = disable;
         self
+    }
+
+    /// Prepare Dioxus Desktop's process-wide Linux host settings.
+    ///
+    /// This selects GTK's X11 backend and, when configured and required,
+    /// disables WebKit's DMA-BUF renderer. It then initializes GTK and
+    /// validates the selected backend. Call it after the final
+    /// [`Self::with_disable_dma_buf_on_wayland`] choice and before starting
+    /// application worker threads. Dioxus validates the prepared host state
+    /// again before constructing its Winit event loop.
+    ///
+    /// # Safety
+    ///
+    /// The current thread must be the process main thread. No other thread may
+    /// read or write the process environment while this method runs. GTK,
+    /// Winit, and WebKit must not have been initialized.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn prepare_linux_host(self) -> Result<Self, crate::LinuxHostError> {
+        // SAFETY: this public method exposes the same caller obligations.
+        unsafe { crate::linux_host::prepare(self.disable_dma_buf_on_wayland)? };
+        Ok(self)
     }
 
     /// Set whether the main window is shown and focused when the tray icon is left-clicked.
@@ -449,7 +595,15 @@ impl Config {
     }
 
     /// Set the configuration for the window opened by `launch`.
-    pub fn with_window(mut self, window: WindowBuilder) -> Self {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_window(mut self, window: WindowAttributes) -> Self {
+        self.window = self.window.with_window(window);
+        self
+    }
+
+    /// Set the configuration for the window.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn with_window(mut self, window: TaoWindowBuilder) -> Self {
         self.window = self.window.with_window(window);
         self
     }
@@ -526,7 +680,21 @@ impl Config {
     }
 
     /// Allows modifying the window and virtual dom right after they are built, but before the webview is created.
-    pub fn with_on_window(mut self, f: impl FnMut(Arc<Window>, &mut VirtualDom) + 'static) -> Self {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn with_on_window(
+        mut self,
+        f: impl FnMut(Arc<dyn winit::window::Window>, &mut VirtualDom) + 'static,
+    ) -> Self {
+        self.window = self.window.with_on_window(f);
+        self
+    }
+
+    /// Allows modifying the window and virtual dom right after they are built, but before the webview is created.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn with_on_window(
+        mut self,
+        f: impl FnMut(Arc<tao::window::Window>, &mut VirtualDom) + 'static,
+    ) -> Self {
         self.window = self.window.with_on_window(f);
         self
     }

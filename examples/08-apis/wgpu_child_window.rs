@@ -5,17 +5,17 @@
 //!
 //! To use this feature set `with_as_child_window()` on your desktop config which will then let you
 
-use dioxus::prelude::*;
-use dioxus::{
-    desktop::tao::{event::Event as WryEvent, window::Window},
-    desktop::{Config, tao::window::WindowBuilder, use_wry_event_handler, window},
+use dioxus::desktop::{
+    Config, WindowAttributes, WindowEvent, use_window_event_handler, window,
+    winit::window::Window as WinitWindow,
 };
+use dioxus::prelude::*;
 use std::sync::Arc;
 use wgpu::CurrentSurfaceTexture;
 
 fn main() {
     let config = Config::new()
-        .with_window(WindowBuilder::new().with_transparent(true))
+        .with_window(WindowAttributes::default().with_transparent(true))
         .with_on_window(|window, dom| {
             let resources = Arc::new(pollster::block_on(async {
                 let resource = GraphicsContextAsyncBuilder {
@@ -47,18 +47,12 @@ fn app() -> Element {
         window().window.request_redraw();
     });
 
-    use_wry_event_handler(move |event, _| {
-        use dioxus::desktop::tao::event::WindowEvent;
-
-        if let WryEvent::WindowEvent {
-            event: WindowEvent::Resized(new_size),
-            ..
-        } = event
-        {
+    use_window_event_handler(move |event, _| {
+        if let WindowEvent::Resized { width, height } = event {
             graphics_resources.with_resources(|srcs| {
                 let mut cfg = srcs.config.clone();
-                cfg.width = new_size.width;
-                cfg.height = new_size.height;
+                cfg.width = width;
+                cfg.height = height;
                 srcs.surface.configure(&srcs.device, &cfg);
             });
 
@@ -84,7 +78,7 @@ fn app() -> Element {
 /// to be able to borrow the window for the wgpu::Surface
 #[ouroboros::self_referencing]
 struct GraphicsContext {
-    desktop: Arc<Window>,
+    desktop: Arc<dyn WinitWindow>,
     #[borrows(desktop)]
     #[not_covariant]
     resources: GraphicsResources<'this>,
@@ -99,8 +93,8 @@ struct GraphicsResources<'a> {
 }
 
 impl<'a> GraphicsResources<'a> {
-    async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
+    async fn new(window: Arc<dyn WinitWindow>) -> Self {
+        let size = window.surface_size();
 
         let instance = wgpu::Instance::default();
 

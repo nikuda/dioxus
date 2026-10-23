@@ -83,6 +83,5 @@ fn ChildWindow(id: usize) -> Element {
 }
 
 fn hidden_window_config() -> WindowConfig {
-    WindowConfig::new()
-        .with_window(dioxus_desktop::tao::window::WindowBuilder::new().with_visible(false))
+    WindowConfig::new().with_window(dioxus_desktop::WindowAttributes::default().with_visible(false))
 }

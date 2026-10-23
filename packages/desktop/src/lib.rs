@@ -8,6 +8,7 @@
 mod android_sync_lock;
 mod app;
 mod assets;
+mod commands;
 mod config;
 mod default_icon;
 mod desktop_context;
@@ -20,6 +21,8 @@ mod events;
 mod file_upload;
 mod hooks;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod linux_host;
 mod menubar;
 mod mobile;
 mod protocol;
@@ -29,6 +32,7 @@ mod waker;
 mod webview;
 mod window_component;
 mod window_lifecycle;
+mod windowing;
 
 // mobile shortcut is only supported on mobile platforms
 #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -37,11 +41,22 @@ mod mobile_shortcut;
 /// The main entrypoint for this crate
 pub mod launch;
 
-// Reexport tao and wry, might want to re-export other important things
+// Mobile retains Tao until its Wry lifecycle has a separate Winit host.
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub use tao;
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub use tao::dpi::{LogicalPosition, LogicalSize};
-pub use tao::event::WindowEvent;
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub use tao::window::WindowBuilder;
+
+/// The window and event-loop library used by supported desktop hosts.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub use winit;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub use winit::dpi::{LogicalPosition, LogicalSize};
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub use winit::window::WindowAttributes;
+
 pub use wry;
 // Reexport muda only if we are on desktop platforms that support menus
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -59,8 +74,12 @@ pub use desktop_context::{
     DesktopContext, DesktopService, PendingDesktopWindow, WeakDesktopContext, app, window,
 };
 pub use desktop_state::DesktopAppContext;
-pub use event_handlers::WryEventHandler;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub use event_handlers::WinitEvent;
+pub use event_handlers::{AppEvent, EventHandlerId, WindowEvent};
 pub use hooks::*;
+#[cfg(target_os = "linux")]
+pub use linux_host::LinuxHostError;
 pub use shortcut::{HotKeyState, ShortcutHandle, ShortcutRegistryError};
 pub use window_component::{Window, WindowProps};
 pub use wry::RequestAsyncResponder;
